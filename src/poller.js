@@ -1,6 +1,9 @@
 const fetch = require("node-fetch");
-const { RPC_URL, POLL_INTERVAL_MS, STALL_THRESHOLD_CHECKS } = require("./config");
-const { recordCheck, getUptime, logEvent } = require("./db");
+const {
+  RPC_URL, POLL_INTERVAL_MS, STALL_THRESHOLD_CHECKS,
+  LATENCY_ALARM_MS, LATENCY_CLEAR_MS, LATENCY_WINDOW_MINUTES, LATENCY_MIN_SAMPLES, SLOW_CALL_MS,
+} = require("./config");
+const { recordCheck, getUptime, logEvent, recordLatency, getLatencyStats } = require("./db");
 const { formatDetailedError } = require("./errors");
 const { sendAlert } = require("./telegram");
 
@@ -9,10 +12,14 @@ let stallCount = 0;
 let alertSent = false;
 let consecutiveFailures = 0;
 let lastHealthy = null; // track state changes
+// Separate from `alertSent` on purpose: degradation and hard-down are independent
+// conditions, and a shared flag would let one silence the other.
+let latencyAlertSent = false;
 
 function getStallCount() { return stallCount; }
 function getLastBlockHeight() { return lastBlockHeight; }
 function isCurrentlyHealthy() { return lastHealthy; }
+function isCurrentlyDegraded() { return latencyAlertSent; }
 
 async function poll() {
   const start = Date.now();
@@ -50,6 +57,7 @@ async function poll() {
 
   // Record every check for uptime calculation
   recordCheck(isHealthy);
+  recordLatency(responseTime, isHealthy);
 
   const uptime = getUptime(24);
 
@@ -101,10 +109,57 @@ async function poll() {
     alertSent = false;
   }
 
+  // --- Degradation alarm ---
+  // Fires on rolling p90 over healthy responses, so it catches the case the up/down
+  // check is blind to: the node answering every poll, but taking seconds to do it.
+  // Hysteresis (fire at LATENCY_ALARM_MS, clear at the lower LATENCY_CLEAR_MS) keeps
+  // it from flapping while p90 sits on the threshold.
+  const lat = getLatencyStats(LATENCY_WINDOW_MINUTES, SLOW_CALL_MS);
+  if (lat && lat.n >= LATENCY_MIN_SAMPLES) {
+    if (!latencyAlertSent && lat.p90 >= LATENCY_ALARM_MS) {
+      logEvent("degraded", {
+        responseTime: lat.p90,
+        message: `p90 ${lat.p90}ms over ${LATENCY_WINDOW_MINUTES}m (p99 ${lat.p99}ms, max ${lat.max}ms, ${lat.slowShare}% of calls >= ${SLOW_CALL_MS}ms)`,
+      });
+      await sendAlert(
+        [
+          `🟠 *Nibiru Node Degraded*`,
+          ``,
+          `The node is answering, but slowly. These polls all count as "up", so uptime will look fine.`,
+          ``,
+          `*Latency (last ${LATENCY_WINDOW_MINUTES}m, ${lat.n} healthy samples)*`,
+          `p50: \`${lat.p50}ms\``,
+          `p90: \`${lat.p90}ms\`  ← alarm at \`${LATENCY_ALARM_MS}ms\``,
+          `p99: \`${lat.p99}ms\``,
+          `max: \`${lat.max}ms\``,
+          `Slow calls (≥ \`${SLOW_CALL_MS}ms\`): \`${lat.slow}/${lat.n}\` (\`${lat.slowShare}%\`)`,
+          `Hard failures in window: \`${lat.failures}\``,
+          ``,
+          `*Endpoint*`,
+          `URL: \`${RPC_URL}\``,
+          `Call: \`eth_blockNumber\` (in-memory read, touches no historical state)`,
+        ].join("\n"),
+        uptime
+      );
+      latencyAlertSent = true;
+    } else if (latencyAlertSent && lat.p90 <= LATENCY_CLEAR_MS) {
+      logEvent("degraded_recovery", {
+        responseTime: lat.p90,
+        message: `p90 back to ${lat.p90}ms over ${LATENCY_WINDOW_MINUTES}m`,
+      });
+      await sendAlert(
+        `🟢 *Nibiru Node Latency Recovered*\np90 back to \`${lat.p90}ms\` over the last ${LATENCY_WINDOW_MINUTES}m (p99 \`${lat.p99}ms\`, max \`${lat.max}ms\`)`,
+        uptime
+      );
+      latencyAlertSent = false;
+    }
+  }
+
   lastHealthy = isHealthy;
 
   const status = isHealthy ? "✓" : "✗";
-  console.log(`[${new Date().toISOString()}] ${status} block=${blockHeight} time=${responseTime}ms status=${statusCode} stall=${stallCount}`);
+  const degradedTag = latencyAlertSent ? " DEGRADED" : "";
+  console.log(`[${new Date().toISOString()}] ${status} block=${blockHeight} time=${responseTime}ms status=${statusCode} stall=${stallCount}${degradedTag}`);
 }
 
-module.exports = { poll, getStallCount, getLastBlockHeight, isCurrentlyHealthy };
+module.exports = { poll, getStallCount, getLastBlockHeight, isCurrentlyHealthy, isCurrentlyDegraded };

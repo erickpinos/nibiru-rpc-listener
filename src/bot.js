@@ -1,11 +1,11 @@
 const fetch = require("node-fetch");
 const TelegramBot = require("node-telegram-bot-api");
-const { RPC_URL, TELEGRAM_BOT_TOKEN, BANK_MIRROR_DENOM } = require("./config");
-const { getUptime, getRecentEvents, getErrorEvents, getErrorDetail, getLatestPeg } = require("./db");
+const { RPC_URL, TELEGRAM_BOT_TOKEN, BANK_MIRROR_DENOM, LATENCY_ALARM_MS, SLOW_CALL_MS } = require("./config");
+const { getUptime, getRecentEvents, getErrorEvents, getErrorDetail, getLatestPeg, getLatencyStats } = require("./db");
 const { classifyError } = require("./errors");
 const { isAlertsMuted, setMute, clearMute, getMuteUntil } = require("./telegram");
 const { timeSince, formatUptime } = require("./utils");
-const { getStallCount, getLastBlockHeight, isCurrentlyHealthy } = require("./poller");
+const { getStallCount, getLastBlockHeight, isCurrentlyHealthy, isCurrentlyDegraded } = require("./poller");
 const { checkPeg, fmt } = require("./pegcheck");
 
 const processStartTime = Date.now();
@@ -16,8 +16,14 @@ function getNodeStatus() {
   const currentBlock = getLastBlockHeight();
   const stallCount = getStallCount();
 
-  const statusEmoji = currentlyHealthy ? "🟢" : "🔴";
+  const degraded = isCurrentlyDegraded();
+  const lat = getLatencyStats(15, SLOW_CALL_MS);
+
+  const statusEmoji = !currentlyHealthy ? "🔴" : degraded ? "🟠" : "🟢";
   const stallStatus = stallCount > 0 ? `⚠️ ${stallCount} stall checks` : "✅ Advancing normally";
+  const latStatus = lat && lat.n > 0
+    ? `${degraded ? "🟠 Degraded" : "✅ Normal"} · p90 \`${lat.p90}ms\`, p99 \`${lat.p99}ms\` (15m)`
+    : "No data yet";
 
   return [
     `${statusEmoji} *Nibiru Node Status*`,
@@ -26,6 +32,7 @@ function getNodeStatus() {
     `Health: ${currentlyHealthy ? "Online" : currentlyHealthy === null ? "Starting..." : "Offline"}`,
     `Block Height: \`${currentBlock || "N/A"}\``,
     `Block Stall: ${stallStatus}`,
+    `Latency: ${latStatus}`,
     ``,
     `*Uptime*`,
     `1h: \`${getUptime(1) ?? "N/A"}%\``,
@@ -208,6 +215,40 @@ function startTelegramBot() {
     }
   });
 
+  bot.onText(/\/latency/, async (msg) => {
+    try {
+      const windows = [[15, "15m"], [60, "1h"], [360, "6h"], [1440, "24h"]];
+      const lines = [
+        `⏱ *Response Time Breakdown*`,
+        ``,
+        `_Percentiles cover successful polls only. A hard failure returns in ~1 RTT and would drag these down._`,
+        ``,
+      ];
+
+      for (const [minutes, label] of windows) {
+        const s = getLatencyStats(minutes, SLOW_CALL_MS);
+        if (!s || s.n === 0) {
+          lines.push(`*${label}*: No data`, ``);
+          continue;
+        }
+        lines.push(
+          `*${label}* (\`${s.n}\` ok / \`${s.failures}\` failed)`,
+          `p50 \`${s.p50}ms\` · p90 \`${s.p90}ms\` · p99 \`${s.p99}ms\` · max \`${s.max}ms\``,
+          `Slow (≥ \`${SLOW_CALL_MS}ms\`): \`${s.slow}\` (\`${s.slowShare}%\`)`,
+          ``
+        );
+      }
+
+      lines.push(`Alarm fires at p90 ≥ \`${LATENCY_ALARM_MS}ms\` over 15m.`);
+      lines.push(`Current: ${isCurrentlyDegraded() ? "🟠 *DEGRADED*" : "✅ Normal"}`);
+
+      await bot.sendMessage(msg.chat.id, lines.join("\n"), { parse_mode: "Markdown" });
+    } catch (err) {
+      console.error("Error handling /latency command:", err.message);
+      await bot.sendMessage(msg.chat.id, "❌ Error fetching latency stats. Please try again.");
+    }
+  });
+
   bot.onText(/\/last(?:\s+(\d+))?/, async (msg, match) => {
     try {
       const n = Math.min(parseInt(match[1] || "10", 10), 50);
@@ -218,7 +259,7 @@ function startTelegramBot() {
         return;
       }
 
-      const typeIcons = { down: "🔴", recovery: "✅", stall: "⚠️", stall_recovery: "✅" };
+      const typeIcons = { down: "🔴", recovery: "✅", stall: "⚠️", stall_recovery: "✅", degraded: "🟠", degraded_recovery: "🟢" };
       const lines = [`📋 *Last ${rows.length} Events*`, ``];
       rows.forEach(row => {
         const icon = typeIcons[row.type] || "ℹ️";
@@ -278,6 +319,7 @@ function startTelegramBot() {
       `/ping - Live check right now`,
       `/peg - USDC.e escrow vs bank-mirror supply (live)`,
       `/uptime - Uptime breakdown (1h, 6h, 24h, 7d)`,
+      `/latency - Response time percentiles (15m, 1h, 6h, 24h)`,
       ``, `*Errors*`,
       `/errors - Error events from the last 24h`,
       `/error <n> - Full detail of nth most recent error`,

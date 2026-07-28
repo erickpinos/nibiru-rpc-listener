@@ -4,6 +4,24 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "30000", 10);
 const STALL_THRESHOLD_CHECKS = parseInt(process.env.STALL_THRESHOLD_CHECKS || "5", 10);
 
+// --- Latency / degradation alarm ---
+// Up-vs-down misses the dominant failure mode on the archive endpoint: the node
+// answers, but slowly. Measured 2026-07-27 over 300 samples, eth_blockNumber (an
+// in-memory read that touches no historical state): archive p90 1.88s / p99 8.50s /
+// max 11.46s, with 14% of SUCCESSFUL calls over 1s. The pruned node behind the same
+// gateway held p99 349ms / max 426ms and never failed. Every one of those slow calls
+// counts as "up" in the uptime buckets, which is why uptime read 98% while the
+// endpoint was degraded roughly a sixth of the time.
+// Percentiles are computed over HEALTHY samples only: a hard failure returns fast
+// (nginx short-circuits an ejected upstream in ~1 RTT) and would drag p90 down,
+// masking the degradation it was caused by.
+const LATENCY_ALARM_MS = parseInt(process.env.LATENCY_ALARM_MS || "1000", 10); // fire when rolling p90 >= this
+const LATENCY_CLEAR_MS = parseInt(process.env.LATENCY_CLEAR_MS || "600", 10); // clear when p90 <= this (hysteresis, stops flapping at the edge)
+const LATENCY_WINDOW_MINUTES = parseInt(process.env.LATENCY_WINDOW_MINUTES || "15", 10);
+const LATENCY_MIN_SAMPLES = parseInt(process.env.LATENCY_MIN_SAMPLES || "20", 10); // don't alarm on thin data
+const SLOW_CALL_MS = parseInt(process.env.SLOW_CALL_MS || "1000", 10); // a "slow call" for the degraded-share stat
+const LATENCY_RETENTION_DAYS = parseInt(process.env.LATENCY_RETENTION_DAYS || "7", 10);
+
 // --- USDC.e peg check (FunToken escrow vs bank-mirror supply) ---
 // The EVM module account escrows the real ERC-20 USDC.e; the bank module mints a
 // 1:1 mirror denom (erc20/<addr>). Invariant: escrow >= mirror supply. A breach
@@ -26,6 +44,12 @@ module.exports = {
   TELEGRAM_CHAT_ID,
   POLL_INTERVAL_MS,
   STALL_THRESHOLD_CHECKS,
+  LATENCY_ALARM_MS,
+  LATENCY_CLEAR_MS,
+  LATENCY_WINDOW_MINUTES,
+  LATENCY_MIN_SAMPLES,
+  SLOW_CALL_MS,
+  LATENCY_RETENTION_DAYS,
   LCD_URL,
   PEG_RPC_URL,
   USDCE_ERC20,
